@@ -1,8 +1,50 @@
-<h1 align="center">喜马拉雅xm文件解密工具</h1>
-<h4 align="center">Ximalaya-XM-Decrypt</h4>
+# .xm 文件解密工具
 
-### 说明
+- [forked form](https://github.com/sld272/Ximalaya-XM-Decrypt)
+- [原始参考](https://www.aynakeya.com/articles/ctf/xi-ma-la-ya-xm-wen-jian-jie-mi-ni-xiang-fen-xi/)
 
-由于喜马拉雅官方客户端下载的音频文件为加密格式，无法在普通播放器中播放，所以我写了这个小工具来解密喜马拉雅下载的音频文件。本工具参考@aynakeya的[博文](https://www.aynakeya.com/2023/03/15/ctf/xi-ma-la-ya-xm-wen-jian-jie-mi-ni-xiang-fen-xi/)，并加入了批量解密的功能。我还写了一个程序[Ximalaya-Downloader](https://github.com/Diaoxiaozhang/Ximalaya-Downloader)，用于直接爬取未加密的喜马拉雅音频文件。本工具作为Ximalaya-Downloader的补充，当每日下载vip音频达到上限时，可以使用客户端下载加密的xm文件并使用本工具解密。
+将 .xm 文件解密，转为普通音频文件
 
-在使用该软件时，请确保xm_encryptor.wasm文件与主程序文件处在同一目录下，最好是一个单独的文件夹。
+## 使用方式
+
+### 1. 安装依赖
+
+```bash
+pip3 install -r requirements.txt
+```
+
+如果要使用 `-mp3` 参数将音频统一转码为 mp3，请先安装 `ffmpeg`。
+
+### 2. 命令格式
+
+```bash
+python3 main.py <输入路径> [输出目录] [-mp3]
+```
+
+- `<输入路径>`: 必填，可以是单个 `.xm` 文件，也可以是包含多个 `.xm` 的目录。
+- `[输出目录]`: 可选，默认是 `./output`。
+- `[-mp3]`: 可选，强制输出 mp3。若原始解密结果不是 mp3，会自动调用 ffmpeg 转码。
+
+### 3. 示例
+
+解密单个文件：
+
+```bash
+python3 main.py /path/to/file.xm
+python3 main.py /path/to/file.xm ./output
+python3 main.py /path/to/file.xm ./output -mp3
+```
+
+批量解密目录：
+
+```bash
+python3 main.py /path/to/directory
+python3 main.py /path/to/directory ./output
+python3 main.py /path/to/directory ./output -mp3
+```
+
+### 4. 输出说明
+
+- 输出目录默认是 `./output`。
+- 文件会按专辑名自动分目录，文件名使用歌曲名。
+- 批量模式会汇总显示成功/失败数量。

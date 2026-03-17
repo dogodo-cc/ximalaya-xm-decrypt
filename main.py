@@ -1,18 +1,61 @@
 import base64
 import io
 import sys
+import re
 import magic
 import pathlib
 import os
 import glob
+import logging
+import shutil
+import subprocess
+import tempfile
 import mutagen
-import tkinter as tk
-from tkinter import filedialog
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from mutagen.easyid3 import ID3
 from wasmer import Store, Module, Instance, Uint8Array, Int32Array, engine
 from wasmer_compiler_cranelift import Compiler
+
+# ANSI color codes
+_RED    = '\033[31m'
+_BLUE   = '\033[34m'
+_GREEN  = '\033[32m'
+_YELLOW = '\033[33m'
+_RESET  = '\033[0m'
+
+# Match an entire already-colored span so its content is not re-colorized
+_COLORIZE_RE = re.compile(
+    r'(\033\[[0-9;]*m(?:(?!\033\[0m)[\s\S])*\033\[0m)'  # already-colored span — pass through
+    r'|(mp3|flac|m4a|wav)'                                 # audio format names   — green
+    r'|(\b\d+\.?\d*\b)',                                  # numbers              — blue
+    re.IGNORECASE,
+)
+
+def _colorize(msg: str) -> str:
+    def _sub(m):
+        if m.group(1):
+            return m.group(1)
+        if m.group(2):
+            return f"{_GREEN}{m.group(2)}{_RESET}"
+        return f"{_BLUE}{m.group(3)}{_RESET}"
+    return _COLORIZE_RE.sub(_sub, msg)
+
+def _path(p: str) -> str:
+    """Format a file path as yellow + quoted, with a leading space."""
+    return f' "{_YELLOW}{p}{_RESET}"'
+
+class _ColorFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if record.levelno >= logging.ERROR:
+            return f"{_RED}{msg}{_RESET}"
+        return _colorize(msg)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_ColorFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
+logger = logging.getLogger(__name__)
 
 
 class XMInfo:
@@ -74,6 +117,12 @@ def get_printable_bytes(x: bytes):
     return x[:get_printable_count(x)]
 
 
+def write_bytes_to_memory(memory_view, data: bytes):
+    """Write bytes data to WebAssembly memory view"""
+    for i, b in enumerate(data):
+        memory_view[i] = b
+
+
 def xm_decrypt(raw_data):
     # load xm encryptor
     # print("loading xm encryptor")
@@ -99,18 +148,19 @@ def xm_decrypt(raw_data):
     de_data = get_printable_bytes(de_data)
     track_id = str(xm_info.tracknumber).encode()
     stack_pointer = xm_encryptor.exports.a(-16)
-    assert isinstance(stack_pointer, int)
+    if not isinstance(stack_pointer, int):
+        raise ValueError(f"Expected stack_pointer to be int, got {type(stack_pointer)}")
     de_data_offset = xm_encryptor.exports.c(len(de_data))
-    assert isinstance(de_data_offset, int)
+    if not isinstance(de_data_offset, int):
+        raise ValueError(f"Expected de_data_offset to be int, got {type(de_data_offset)}")
     track_id_offset = xm_encryptor.exports.c(len(track_id))
-    assert isinstance(track_id_offset, int)
+    if not isinstance(track_id_offset, int):
+        raise ValueError(f"Expected track_id_offset to be int, got {type(track_id_offset)}")
     memory_i = xm_encryptor.exports.i
     memview_unit8: Uint8Array = memory_i.uint8_view(offset=de_data_offset)
-    for i, b in enumerate(de_data):
-        memview_unit8[i] = b
+    write_bytes_to_memory(memview_unit8, de_data)
     memview_unit8: Uint8Array = memory_i.uint8_view(offset=track_id_offset)
-    for i, b in enumerate(track_id):
-        memview_unit8[i] = b
+    write_bytes_to_memory(memview_unit8, track_id)
     # print(bytearray(memory_i.buffer)[track_id_offset:track_id_offset + len(track_id)].decode())
     # print(f"decrypt stage 2 (xmDecrypt):\n"
     #       f"    stack_pointer = {stack_pointer},\n"
@@ -121,7 +171,8 @@ def xm_decrypt(raw_data):
     memview_int32: Int32Array = memory_i.int32_view(offset=stack_pointer // 4)
     result_pointer = memview_int32[0]
     result_length = memview_int32[1]
-    assert memview_int32[2] == 0, memview_int32[3] == 0
+    if memview_int32[2] != 0 or memview_int32[3] != 0:
+        raise RuntimeError(f"XM decryption validation failed: flags[2]={memview_int32[2]}, flags[3]={memview_int32[3]}")
     result_data = bytearray(memory_i.buffer)[result_pointer:result_pointer + result_length].decode()
     # Stage 3 combine
     # print(f"Stage 3 (base64)")
@@ -132,32 +183,95 @@ def xm_decrypt(raw_data):
 
 
 def find_ext(data):
-    exts = ["m4a", "mp3", "flac", "wav"]
-    value = magic.from_buffer(data).lower()
-    for ext in exts:
-        if ext in value:
-            return ext
-    raise Exception(f"unexpected format {value}")
+    """Detect audio format by magic bytes and file signatures"""
+    if len(data) < 4:
+        raise ValueError("Data too short to detect format")
+    
+    # Check by magic byte signatures (most reliable)
+    if data[:3] == b'ID3' or data[:2] == b'\xff\xfb' or data[:2] == b'\xff\xfa':
+        logger.debug("Detected MP3 format by magic bytes")
+        return 'mp3'
+    
+    if data[:4] == b'fLaC':
+        logger.debug("Detected FLAC format by magic bytes")
+        return 'flac'
+    
+    if data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'WAVE':
+        logger.debug("Detected WAV format by magic bytes")
+        return 'wav'
+    
+    # Check M4A/MP4 format (atom-based)
+    if len(data) >= 8 and data[4:8] == b'ftyp':
+        if len(data) >= 12:
+            brand = data[8:12].decode('latin1', errors='ignore')
+            if any(sig in brand for sig in ['M4A', 'isom', 'iso2', 'mp42']):
+                logger.debug(f"Detected M4A format by ftyp brand: {brand}")
+                return 'm4a'
+    
+    # Fallback to magic library detection
+    try:
+        magic_result = magic.from_buffer(data[:4096]).lower()
+        logger.debug(f"Magic library detected: {magic_result}")
+        for ext in ['m4a', 'mp3', 'flac', 'wav']:
+            if ext in magic_result:
+                return ext
+    except Exception as e:
+        logger.warning(f"Magic library detection failed: {e}")
+    
+    raise ValueError(f"Failed to detect audio format from data signature")
 
 
-def decrypt_xm_file(from_file, output_path='./output'):
-    print(f"正在解密{from_file}")
+def convert_to_mp3(audio_data: bytes, source_ext: str):
+    """Convert audio bytes to mp3 using ffmpeg."""
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("未找到 ffmpeg，请先安装 ffmpeg 后再使用 -mp3 参数")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_file = os.path.join(temp_dir, f"input.{source_ext}")
+        output_file = os.path.join(temp_dir, "output.mp3")
+
+        with open(input_file, "wb") as f:
+            f.write(audio_data)
+
+        cmd = [ffmpeg_path, "-y", "-i", input_file, "-vn", "-codec:a", "libmp3lame", "-q:a", "2", output_file]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"音频转码失败: {result.stderr.strip()}")
+
+        with open(output_file, "rb") as f:
+            return f.read()
+
+
+def decrypt_xm_file(from_file, output_path='./output', force_mp3=False):
+    logger.info(f"正在解密{_path(from_file)}")
     data = read_file(from_file)
     info, audio_data = xm_decrypt(data)
-    output = f"{output_path}/{replace_invalid_chars(info.album)}/{replace_invalid_chars(info.title)}.{find_ext(audio_data[:0xff])}"
+    detected_ext = find_ext(audio_data[:0xff])
+    output_ext = detected_ext
+
+    if force_mp3 and detected_ext != 'mp3':
+        logger.info(f"检测到格式为 {detected_ext}，开始转码为 mp3")
+        audio_data = convert_to_mp3(audio_data, detected_ext)
+        output_ext = 'mp3'
+
+    output = f"{output_path}/{replace_invalid_chars(info.album)}/{replace_invalid_chars(info.title)}.{output_ext}"
     if not os.path.exists(f"{output_path}/{replace_invalid_chars(info.album)}"):
         os.makedirs(f"{output_path}/{replace_invalid_chars(info.album)}")
     buffer = io.BytesIO(audio_data)
     tags = mutagen.File(buffer, easy=True)
-    tags["title"] = info.title
-    tags["album"] = info.album
-    tags["artist"] = info.artist
-    print(tags.pprint())
-    tags.save(buffer)
+    if tags is not None:
+        tags["title"] = info.title
+        tags["album"] = info.album
+        tags["artist"] = info.artist
+        logger.debug(tags.pprint())
+        tags.save(buffer)
+    else:
+        logger.warning("无法识别音频标签格式，跳过标签写入")
     with open(output, "wb") as f:
         buffer.seek(0)
         f.write(buffer.read())
-    print(f"解密成功，文件保存至{output}！")
+    logger.info(f"解密成功，文件保存至{_path(output)}！")
 
 
 def replace_invalid_chars(name):
@@ -168,57 +282,73 @@ def replace_invalid_chars(name):
     return name
 
 
-def select_file():
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename()
-    root.destroy()
-    return file_path
-
-
-def select_directory():
-    root = tk.Tk()
-    root.withdraw()
-    directory_path = filedialog.askdirectory()
-    root.destroy()
-    return directory_path
-
-
 if __name__ == "__main__":
-    while True:
-        print("欢迎使用喜马拉雅音频解密工具")
-        print("本工具仅供学习交流使用，严禁用于商业用途")
-        print("请选择您想要使用的功能：")
-        print("1. 解密单个文件")
-        print("2. 批量解密文件")
-        print("3. 退出")
-        choice = input()
-        if choice == "1" or choice == "2":
-            if choice == "1":
-                files_to_decrypt = [select_file()]
-                if files_to_decrypt == [""]:
-                    print("检测到文件选择窗口被关闭")
-                    continue
-            elif choice == "2":
-                dir_to_decrypt = select_directory()
-                if dir_to_decrypt == "":
-                    print("检测到目录选择窗口被关闭")
-                    continue
-                files_to_decrypt = glob.glob(os.path.join(dir_to_decrypt, "*.xm"))
-            print("请选择是否需要设置输出路径：（不设置默认为本程序目录下的output文件夹）")
-            print("1. 设置输出路径")
-            print("2. 不设置输出路径")
-            choice = input()
-            if choice == "1":
-                output_path = select_directory()
-                if output_path == "":
-                    print("检测到目录选择窗口被关闭")
-                    continue
-            elif choice == "2":
-                output_path = "./output"
-            for file in files_to_decrypt:
-                decrypt_xm_file(file, output_path)
-        elif choice == "3":
-            sys.exit()
-        else:
-            print("输入错误，请重新输入！")
+    args = sys.argv[1:]
+    force_mp3 = False
+    if "-mp3" in args:
+        force_mp3 = True
+        args = [arg for arg in args if arg != "-mp3"]
+
+    if len(args) < 1:
+        logger.info("使用方法:")
+        logger.info("  解密单个文件: python3 main.py <xm_file_path> [output_path] [-mp3]")
+        logger.info("  批量解密文件: python3 main.py <directory_path> [output_path] [-mp3]")
+        logger.info("\n示例:")
+        logger.info("  python3 main.py /path/to/file.xm")
+        logger.info("  python3 main.py /path/to/file.xm ./output")
+        logger.info("  python3 main.py /path/to/file.xm ./output -mp3")
+        logger.info("  python3 main.py /path/to/directory")
+        logger.info("  python3 main.py /path/to/directory ./output")
+        logger.info("  python3 main.py /path/to/directory ./output -mp3")
+        sys.exit(1)
+
+    input_path = args[0]
+    output_path = "./output"
+    
+    # 根据输入路径类型自动判断是否为批量模式
+    if os.path.isdir(input_path):
+        is_batch = True
+    else:
+        is_batch = False
+    
+    # 处理输出路径参数
+    if len(args) >= 2:
+        output_path = args[1]
+    
+    files_to_decrypt = []
+    
+    if is_batch:
+        if not os.path.isdir(input_path):
+            logger.error(f"错误: {input_path} 不是有效的目录")
+            sys.exit(1)
+        files_to_decrypt = glob.glob(os.path.join(input_path, "*.xm"))
+        if not files_to_decrypt:
+            logger.error(f"错误: 在 {input_path} 中找不到 .xm 文件")
+            sys.exit(1)
+        logger.info(f"找到 {len(files_to_decrypt)} 个文件待解密")
+    else:
+        if not os.path.isfile(input_path):
+            logger.error(f"错误: {input_path} 不是有效的文件")
+            sys.exit(1)
+        if not input_path.lower().endswith('.xm'):
+            logger.warning(f"警告: {input_path} 可能不是 .xm 文件")
+        files_to_decrypt = [input_path]
+    
+    logger.info(f"输出路径:{_path(output_path)}")
+    logger.info("-" * 50)
+    
+    total_files = len(files_to_decrypt)
+    successful = 0
+    failed = 0
+    
+    for idx, file in enumerate(files_to_decrypt, 1):
+        try:
+            logger.info(f"[{idx}/{total_files}] 处理文件: {os.path.basename(file)}")
+            decrypt_xm_file(file, output_path, force_mp3)
+            successful += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"[{idx}/{total_files}] 解密 {file} 失败: {e}")
+    
+    logger.info("-" * 50)
+    logger.info(f"解密完成！成功: {successful}/{total_files}, 失败: {failed}/{total_files}")

@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "awk": true,
+        "/^/Users/alan/Documents/Ximalaya-XM-Decrypt/\\.venv/bin/python - <<'PY'\nfrom wasmer import Store, Module, engine\nfrom wasmer_compiler_cranelift import Compiler\nfrom pathlib import Path\nstore = Store\\(engine\\.Universal\\(Compiler\\)\\)\nmodule = Module\\(store, Path\\('xm_encryptor\\.wasm'\\)\\.read_bytes\\(\\)\\)\nprint\\('imports:', module\\.imports\\)\nprint\\('exports:', module\\.exports\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
