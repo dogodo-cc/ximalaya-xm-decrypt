@@ -167,3 +167,4 @@ output/
 
 # python
 python/
+.DS_Store

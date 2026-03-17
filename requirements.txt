@@ -3,3 +3,4 @@ pycryptodome
 wasmer
 python-magic
 wasmer_compiler_cranelift
+rich

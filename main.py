@@ -5,17 +5,20 @@ import re
 import magic
 import pathlib
 import os
-import glob
 import logging
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import mutagen
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from mutagen.easyid3 import ID3
 from wasmer import Store, Module, Instance, Uint8Array, Int32Array, engine
 from wasmer_compiler_cranelift import Compiler
+from rich.console import Console, Group
+from rich.live import Live
+from rich.progress import BarColumn, Progress, TextColumn
 
 # ANSI color codes
 _RED    = '\033[31m'
@@ -56,6 +59,20 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(_ColorFormatter())
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger(__name__)
+console = Console()
+
+_XM_ENCRYPTOR = None
+
+
+def get_xm_encryptor():
+    global _XM_ENCRYPTOR
+    if _XM_ENCRYPTOR is None:
+        wasm_path = pathlib.Path(__file__).with_name("xm_encryptor.wasm")
+        _XM_ENCRYPTOR = Instance(Module(
+            Store(engine.Universal(Compiler)),
+            wasm_path.read_bytes()
+        ))
+    return _XM_ENCRYPTOR
 
 
 class XMInfo:
@@ -76,20 +93,12 @@ class XMInfo:
         return bytes.fromhex(self.encodedby)
 
 
-def get_str(x):
-    if x is None:
-        return ""
-    return x
-
-
 def read_file(x):
     with open(x, "rb") as f:
         return f.read()
 
 
-# return number of id3 bytes
 def get_xm_info(data: bytes):
-    # print(EasyID3(io.BytesIO(data)))
     id3 = ID3(io.BytesIO(data), v2_version=3)
     id3value = XMInfo()
     id3value.title = str(id3["TIT2"])
@@ -119,31 +128,31 @@ def get_printable_bytes(x: bytes):
 
 def write_bytes_to_memory(memory_view, data: bytes):
     """Write bytes data to WebAssembly memory view"""
+    if not data:
+        return
+
+    # Prefer bulk copy to avoid Python-level per-byte loop overhead.
+    try:
+        memory_view[0:len(data)] = data
+        return
+    except Exception:
+        pass
+
     for i, b in enumerate(data):
         memory_view[i] = b
 
 
 def xm_decrypt(raw_data):
-    # load xm encryptor
-    # print("loading xm encryptor")
-    xm_encryptor = Instance(Module(
-        Store(engine.Universal(Compiler)),
-        pathlib.Path("./xm_encryptor.wasm").read_bytes()
-    ))
-    # decode id3
+    # Reuse Wasm instance in current process to avoid repeated heavy initialization.
+    xm_encryptor = get_xm_encryptor()
     xm_info = get_xm_info(raw_data)
-    # print("id3 header size: ", hex(xm_info.header_size))
     encrypted_data = raw_data[xm_info.header_size:xm_info.header_size + xm_info.size:]
 
     # Stage 1 aes-256-cbc
     xm_key = b"ximalayaximalayaximalayaximalaya"
-    # print(f"decrypt stage 1 (aes-256-cbc):\n"
-    #       f"    data length = {len(encrypted_data)},\n"
-    #       f"    key = {xm_key},\n"
-    #       f"    iv = {xm_info.iv().hex()}")
     cipher = AES.new(xm_key, AES.MODE_CBC, xm_info.iv())
     de_data = cipher.decrypt(pad(encrypted_data, 16))
-    # print("success")
+
     # Stage 2 xmDecrypt
     de_data = get_printable_bytes(de_data)
     track_id = str(xm_info.tracknumber).encode()
@@ -161,12 +170,6 @@ def xm_decrypt(raw_data):
     write_bytes_to_memory(memview_unit8, de_data)
     memview_unit8: Uint8Array = memory_i.uint8_view(offset=track_id_offset)
     write_bytes_to_memory(memview_unit8, track_id)
-    # print(bytearray(memory_i.buffer)[track_id_offset:track_id_offset + len(track_id)].decode())
-    # print(f"decrypt stage 2 (xmDecrypt):\n"
-    #       f"    stack_pointer = {stack_pointer},\n"
-    #       f"    data_pointer = {de_data_offset}, data_length = {len(de_data)},\n"
-    #       f"    track_id_pointer = {track_id_offset}, track_id_length = {len(track_id)}")
-    # print("success")
     xm_encryptor.exports.g(stack_pointer, de_data_offset, len(de_data), track_id_offset, len(track_id))
     memview_int32: Int32Array = memory_i.int32_view(offset=stack_pointer // 4)
     result_pointer = memview_int32[0]
@@ -174,11 +177,10 @@ def xm_decrypt(raw_data):
     if memview_int32[2] != 0 or memview_int32[3] != 0:
         raise RuntimeError(f"XM decryption validation failed: flags[2]={memview_int32[2]}, flags[3]={memview_int32[3]}")
     result_data = bytearray(memory_i.buffer)[result_pointer:result_pointer + result_length].decode()
+
     # Stage 3 combine
-    # print(f"Stage 3 (base64)")
     decrypted_data = base64.b64decode(xm_info.encoding_technology + result_data)
     final_data = decrypted_data + raw_data[xm_info.header_size + xm_info.size::]
-    # print("success")
     return xm_info, final_data
 
 
@@ -243,21 +245,30 @@ def convert_to_mp3(audio_data: bytes, source_ext: str):
             return f.read()
 
 
-def decrypt_xm_file(from_file, output_path='./output', force_mp3=False):
-    logger.info(f"正在解密{_path(from_file)}")
+def decrypt_xm_file(from_file, output_path='./output', force_mp3=False, output_file=None, verbose=True):
+    if verbose:
+        logger.info(f"正在解密{_path(from_file)}")
     data = read_file(from_file)
     info, audio_data = xm_decrypt(data)
     detected_ext = find_ext(audio_data[:0xff])
     output_ext = detected_ext
 
     if force_mp3 and detected_ext != 'mp3':
-        logger.info(f"检测到格式为 {detected_ext}，开始转码为 mp3")
+        if verbose:
+            logger.info(f"检测到格式为 {detected_ext}，开始转码为 mp3")
         audio_data = convert_to_mp3(audio_data, detected_ext)
         output_ext = 'mp3'
 
-    output = f"{output_path}/{replace_invalid_chars(info.album)}/{replace_invalid_chars(info.title)}.{output_ext}"
-    if not os.path.exists(f"{output_path}/{replace_invalid_chars(info.album)}"):
-        os.makedirs(f"{output_path}/{replace_invalid_chars(info.album)}")
+    if output_file is None:
+        original_name = replace_invalid_chars(os.path.splitext(os.path.basename(from_file))[0])
+        output = os.path.join(output_path, f"{original_name}.{output_ext}")
+    else:
+        output_base = os.path.splitext(output_file)[0]
+        output = f"{output_base}.{output_ext}"
+
+    output_dir = os.path.dirname(output)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     buffer = io.BytesIO(audio_data)
     tags = mutagen.File(buffer, easy=True)
     if tags is not None:
@@ -271,7 +282,18 @@ def decrypt_xm_file(from_file, output_path='./output', force_mp3=False):
     with open(output, "wb") as f:
         buffer.seek(0)
         f.write(buffer.read())
-    logger.info(f"解密成功，文件保存至{_path(output)}！")
+    if verbose:
+        logger.info(f"解密成功，文件保存至{_path(output)}！")
+
+
+def collect_xm_files(root_dir):
+    """Recursively collect .xm files under root_dir (case-insensitive)."""
+    files = []
+    for current_root, _, file_names in os.walk(root_dir):
+        for file_name in file_names:
+            if file_name.lower().endswith('.xm'):
+                files.append(os.path.join(current_root, file_name))
+    return sorted(files)
 
 
 def replace_invalid_chars(name):
@@ -280,6 +302,29 @@ def replace_invalid_chars(name):
         if char in name:
             name = name.replace(char, " ")
     return name
+
+
+def build_batch_progress_renderable(total_files, output_path, current_file, progress):
+    return Group(
+        f"当前任务总数：{total_files}",
+        f"当前输出路径：{output_path}",
+        f"当前完成任务：{current_file}",
+        progress,
+    )
+
+
+def decrypt_xm_file_worker(file_path, input_path, output_path, force_mp3):
+    """Worker function for multiprocessing batch decryption."""
+    try:
+        # Worker logs are suppressed; parent process prints ordered progress.
+        logger.setLevel(logging.ERROR)
+        relative_path = os.path.relpath(file_path, input_path)
+        target_file_without_ext = os.path.splitext(relative_path)[0]
+        target_file = os.path.join(output_path, f"{target_file_without_ext}.xm")
+        decrypt_xm_file(file_path, output_path, force_mp3, output_file=target_file, verbose=False)
+        return True, file_path, ""
+    except Exception as e:
+        return False, file_path, str(e)
 
 
 if __name__ == "__main__":
@@ -318,14 +363,10 @@ if __name__ == "__main__":
     files_to_decrypt = []
     
     if is_batch:
-        if not os.path.isdir(input_path):
-            logger.error(f"错误: {input_path} 不是有效的目录")
-            sys.exit(1)
-        files_to_decrypt = glob.glob(os.path.join(input_path, "*.xm"))
+        files_to_decrypt = collect_xm_files(input_path)
         if not files_to_decrypt:
-            logger.error(f"错误: 在 {input_path} 中找不到 .xm 文件")
+            logger.error(f"错误: 在 {input_path} 及其子目录中找不到 .xm 文件")
             sys.exit(1)
-        logger.info(f"找到 {len(files_to_decrypt)} 个文件待解密")
     else:
         if not os.path.isfile(input_path):
             logger.error(f"错误: {input_path} 不是有效的文件")
@@ -334,21 +375,57 @@ if __name__ == "__main__":
             logger.warning(f"警告: {input_path} 可能不是 .xm 文件")
         files_to_decrypt = [input_path]
     
-    logger.info(f"输出路径:{_path(output_path)}")
-    logger.info("-" * 50)
-    
     total_files = len(files_to_decrypt)
     successful = 0
     failed = 0
     
-    for idx, file in enumerate(files_to_decrypt, 1):
-        try:
-            logger.info(f"[{idx}/{total_files}] 处理文件: {os.path.basename(file)}")
-            decrypt_xm_file(file, output_path, force_mp3)
-            successful += 1
-        except Exception as e:
-            failed += 1
-            logger.error(f"[{idx}/{total_files}] 解密 {file} 失败: {e}")
+    if is_batch and total_files > 1:
+        worker_count = min(total_files, os.cpu_count() or 1)
+        progress = Progress(
+            TextColumn("当前任务进度："),
+            BarColumn(bar_width=30),
+            TextColumn("{task.completed}/{task.total} ({task.percentage:>3.0f}%)"),
+            console=console,
+            expand=False,
+        )
+        task_id = progress.add_task("decrypt", total=total_files)
+        completed_count = 0
+        current_file = "等待中"
+
+        with Live(
+            build_batch_progress_renderable(total_files, output_path, current_file, progress),
+            console=console,
+            refresh_per_second=10,
+            transient=False,
+        ) as live:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(decrypt_xm_file_worker, file, input_path, output_path, force_mp3)
+                    for file in files_to_decrypt
+                ]
+
+                for future in as_completed(futures):
+                    current_ok, current_file_path, current_err = future.result()
+                    completed_count += 1
+                    if current_ok:
+                        successful += 1
+                    else:
+                        failed += 1
+                        logger.error(f"批量解密失败: {current_file_path}: {current_err}")
+
+                    current_file = os.path.basename(current_file_path)
+                    progress.update(task_id, completed=completed_count)
+                    live.update(
+                        build_batch_progress_renderable(total_files, output_path, current_file, progress)
+                    )
+    else:
+        for idx, file in enumerate(files_to_decrypt, 1):
+            try:
+                logger.info(f"[{idx}/{total_files}] 处理文件: {os.path.basename(file)}")
+                decrypt_xm_file(file, output_path, force_mp3)
+                successful += 1
+            except Exception as e:
+                failed += 1
+                logger.error(f"[{idx}/{total_files}] 解密 {file} 失败: {e}")
     
-    logger.info("-" * 50)
-    logger.info(f"解密完成！成功: {successful}/{total_files}, 失败: {failed}/{total_files}")
+    logger.info(f"=====>> 解密完成！成功: {successful}/{total_files}, 失败: {failed}/{total_files}")
