@@ -5,6 +5,42 @@
 
 将 .xm 文件解密，转为普通音频文件
 
+## Node.js 版本
+
+仓库中额外提供了一个基于 ESM 的 Node.js 实现 [xm_decrypt.js](xm_decrypt.js)。
+
+### 1. 环境要求
+
+- Node.js 22 及以上
+- 如需使用 `-mp3` 转码，系统中需要先安装 `ffmpeg`
+- 需要先安装 npm 依赖：`music-metadata`、`node-id3`
+
+### 2. 安装依赖
+
+```bash
+npm install
+```
+
+### 3. 使用方式
+
+```bash
+npm run decrypt -- /path/to/file.xm
+npm run decrypt -- /path/to/file.xm -mp3
+npm run decrypt -- /path/to/directory
+
+node xm_decrypt.js /path/to/file.xm
+```
+
+### 4. 说明
+
+- 命令行参数、输出目录规则与 Python 版本保持一致
+- Node.js 版本同样使用本地的 `xm_encryptor.wasm` 完成第二阶段解密
+- Node.js 版本使用 `node-id3` 写入 mp3 的标题、专辑、歌手标签
+- Node.js 版本使用 `music-metadata` 优先识别输出音频格式
+- Node.js 版本支持为 mp3、flac、m4a 写入标题、专辑、歌手标签
+- 批量处理时会按 CPU 核心数自动限制并发，兼顾速度与稳定性
+- 在交互式终端中批量处理时，会以多行实时刷新方式显示当前完成文件与当前任务进度
+
 ## 项目初始化
 
 ### 1. 环境要求

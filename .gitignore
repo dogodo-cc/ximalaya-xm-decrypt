@@ -168,3 +168,5 @@ output/
 # python
 python/
 .DS_Store
+node_modules/
+test_unlock/

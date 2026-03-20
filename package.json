@@ -1,0 +1,16 @@
+{
+    "name": "ximalaya-xm-decrypt",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "main": "./main.js",
+    "engines": {
+        "node": ">=22"
+    },
+    "dependencies": {
+        "log-update": "^6.1.0",
+        "music-metadata": "^11.12.3",
+        "node-id3": "^0.2.9",
+        "p-limit": "^7.3.0"
+    }
+}
