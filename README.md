@@ -51,12 +51,12 @@ python3 main.py
 ### 1. 命令格式
 
 ```bash
-python3 main.py <输入路径> [输出目录] [-mp3]
+python3 main.py <输入路径> [-mp3]
 ```
 
 - `<输入路径>`: 必填，可以是单个 `.xm` 文件，也可以是包含多个 `.xm` 的目录。
-- `[输出目录]`: 可选，默认是 `./output`。
 - `[-mp3]`: 可选，强制输出 mp3。若原始解密结果不是 mp3，会自动调用 ffmpeg 转码。
+- 输出目录不再手动指定，会自动创建在“输入目录”的同级位置，目录名为原目录名后追加 `_unlock`。
 
 ### 2. 示例
 
@@ -71,23 +71,22 @@ source .venv/bin/activate
 
 ```bash
 python3 main.py /path/to/file.xm
-python3 main.py /path/to/file.xm ./output
-python3 main.py /path/to/file.xm ./output -mp3
+python3 main.py /path/to/file.xm -mp3
 ```
 
 批量解密目录：
 
 ```bash
 python3 main.py /path/to/directory
-python3 main.py /path/to/directory ./output
-python3 main.py /path/to/directory ./output -mp3
+python3 main.py /path/to/directory -mp3
 ```
 
 ### 3. 输出说明
 
-- 输出目录默认是 `./output`。
-- 单文件模式下，输出文件默认以原始文件名命名。
-- 批量模式下，会保留输入目录的相对目录结构。
+- 如果输入是 `/path/to/a/file.xm`，输出目录是 `/path/to/a_unlock/`，只处理该文件，不递归扫描其他文件。
+- 如果输入是 `/path/to/a/`，输出目录是 `/path/to/a_unlock/`，并保留原目录下的相对目录结构。
+- 输出文件默认使用原始文件名命名。
+- 写回音频元数据时，标题字段会使用原始文件名。
 - 程序结束后会汇总显示成功/失败数量。
 
 ## 常见初始化问题

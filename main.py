@@ -9,6 +9,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import mutagen
 from Crypto.Cipher import AES
@@ -75,17 +76,17 @@ def get_xm_encryptor():
     return _XM_ENCRYPTOR
 
 
+@dataclass
 class XMInfo:
-    def __init__(self):
-        self.title = ""
-        self.artist = ""
-        self.album = ""
-        self.tracknumber = 0
-        self.size = 0
-        self.header_size = 0
-        self.ISRC = ""
-        self.encodedby = ""
-        self.encoding_technology = ""
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    tracknumber: int = 0
+    size: int = 0
+    header_size: int = 0
+    ISRC: str = ""
+    encodedby: str = ""
+    encoding_technology: str = ""
 
     def iv(self):
         if self.ISRC != "":
@@ -93,37 +94,26 @@ class XMInfo:
         return bytes.fromhex(self.encodedby)
 
 
-def read_file(x):
-    with open(x, "rb") as f:
-        return f.read()
-
-
 def get_xm_info(data: bytes):
     id3 = ID3(io.BytesIO(data), v2_version=3)
-    id3value = XMInfo()
-    id3value.title = str(id3["TIT2"])
-    id3value.album = str(id3["TALB"])
-    id3value.artist = str(id3["TPE1"])
-    id3value.tracknumber = int(str(id3["TRCK"]))
-    id3value.ISRC = "" if id3.get("TSRC") is None else str(id3["TSRC"])
-    id3value.encodedby = "" if id3.get("TENC") is None else str(id3["TENC"])
-    id3value.size = int(str(id3["TSIZ"]))
-    id3value.header_size = id3.size
-    id3value.encoding_technology = str(id3["TSSE"])
-    return id3value
+    return XMInfo(
+        title=str(id3["TIT2"]),
+        album=str(id3["TALB"]),
+        artist=str(id3["TPE1"]),
+        tracknumber=int(str(id3["TRCK"])),
+        ISRC="" if id3.get("TSRC") is None else str(id3["TSRC"]),
+        encodedby="" if id3.get("TENC") is None else str(id3["TENC"]),
+        size=int(str(id3["TSIZ"])),
+        header_size=id3.size,
+        encoding_technology=str(id3["TSSE"]),
+    )
 
 
-def get_printable_count(x: bytes):
-    i = 0
-    for i, c in enumerate(x):
-        # all pritable
-        if c < 0x20 or c > 0x7e:
-            return i
-    return i
-
-
-def get_printable_bytes(x: bytes):
-    return x[:get_printable_count(x)]
+def get_printable_prefix(data: bytes):
+    for index, value in enumerate(data):
+        if value < 0x20 or value > 0x7e:
+            return data[:index]
+    return data
 
 
 def write_bytes_to_memory(memory_view, data: bytes):
@@ -154,7 +144,7 @@ def xm_decrypt(raw_data):
     de_data = cipher.decrypt(pad(encrypted_data, 16))
 
     # Stage 2 xmDecrypt
-    de_data = get_printable_bytes(de_data)
+    de_data = get_printable_prefix(de_data)
     track_id = str(xm_info.tracknumber).encode()
     stack_pointer = xm_encryptor.exports.a(-16)
     if not isinstance(stack_pointer, int):
@@ -245,13 +235,28 @@ def convert_to_mp3(audio_data: bytes, source_ext: str):
             return f.read()
 
 
-def decrypt_xm_file(from_file, output_path='./output', force_mp3=False, output_file=None, verbose=True):
+def write_audio_tags(buffer: io.BytesIO, info: XMInfo, file_stem: str):
+    tags = mutagen.File(buffer, easy=True)
+    if tags is None:
+        logger.warning("无法识别音频标签格式，跳过标签写入")
+        return
+
+    tags["title"] = file_stem
+    tags["album"] = info.album
+    tags["artist"] = info.artist
+    logger.debug(tags.pprint())
+    tags.save(buffer)
+
+
+def decrypt_xm_file(from_file, output_dir='./output', force_mp3=False, verbose=True):
     if verbose:
         logger.info(f"正在解密{_path(from_file)}")
-    data = read_file(from_file)
+    with open(from_file, "rb") as f:
+        data = f.read()
     info, audio_data = xm_decrypt(data)
     detected_ext = find_ext(audio_data[:0xff])
     output_ext = detected_ext
+    file_stem = replace_invalid_chars(os.path.splitext(os.path.basename(from_file))[0]).strip()
 
     if force_mp3 and detected_ext != 'mp3':
         if verbose:
@@ -259,26 +264,11 @@ def decrypt_xm_file(from_file, output_path='./output', force_mp3=False, output_f
         audio_data = convert_to_mp3(audio_data, detected_ext)
         output_ext = 'mp3'
 
-    if output_file is None:
-        original_name = replace_invalid_chars(os.path.splitext(os.path.basename(from_file))[0])
-        output = os.path.join(output_path, f"{original_name}.{output_ext}")
-    else:
-        output_base = os.path.splitext(output_file)[0]
-        output = f"{output_base}.{output_ext}"
-
-    output_dir = os.path.dirname(output)
+    output = os.path.join(output_dir, f"{file_stem}.{output_ext}")
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     buffer = io.BytesIO(audio_data)
-    tags = mutagen.File(buffer, easy=True)
-    if tags is not None:
-        tags["title"] = info.title
-        tags["album"] = info.album
-        tags["artist"] = info.artist
-        logger.debug(tags.pprint())
-        tags.save(buffer)
-    else:
-        logger.warning("无法识别音频标签格式，跳过标签写入")
+    write_audio_tags(buffer, info, file_stem)
     with open(output, "wb") as f:
         buffer.seek(0)
         f.write(buffer.read())
@@ -304,6 +294,51 @@ def replace_invalid_chars(name):
     return name
 
 
+def build_unlock_output_path(input_dir):
+    normalized_input_dir = os.path.abspath(input_dir)
+    input_dir_name = os.path.basename(normalized_input_dir)
+    if input_dir_name == "":
+        raise ValueError("不支持直接使用根目录作为输入目录")
+    return os.path.join(os.path.dirname(normalized_input_dir), f"{input_dir_name}_unlock")
+
+
+def build_target_output_dir(file_path, input_root_dir, output_root_dir):
+    relative_dir = os.path.dirname(os.path.relpath(file_path, input_root_dir))
+    return output_root_dir if relative_dir == "" else os.path.join(output_root_dir, relative_dir)
+
+
+def resolve_input_files(input_path):
+    normalized_input_path = os.path.abspath(input_path)
+    if os.path.isdir(normalized_input_path):
+        input_root_dir = normalized_input_path
+        files_to_decrypt = collect_xm_files(input_root_dir)
+        if not files_to_decrypt:
+            raise FileNotFoundError(f"在 {input_root_dir} 及其子目录中找不到 .xm 文件")
+        return input_root_dir, files_to_decrypt
+
+    if not os.path.isfile(normalized_input_path):
+        raise FileNotFoundError(f"{input_path} 不是有效的文件或目录")
+
+    if not normalized_input_path.lower().endswith('.xm'):
+        logger.warning(f"警告: {normalized_input_path} 可能不是 .xm 文件")
+
+    return os.path.dirname(normalized_input_path), [normalized_input_path]
+
+
+def print_usage():
+    logger.info("使用方法:")
+    logger.info("  python3 main.py <xm_file_path_or_directory> [-mp3]")
+    logger.info("\n说明:")
+    logger.info("  传入文件时，只处理该文件，并以其父目录作为输入目录")
+    logger.info("  传入目录时，递归处理目录下所有 .xm 文件")
+    logger.info("  输出目录固定为输入目录同级的 *_unlock 目录")
+    logger.info("\n示例:")
+    logger.info("  python3 main.py /path/to/file.xm")
+    logger.info("  python3 main.py /path/to/file.xm -mp3")
+    logger.info("  python3 main.py /path/to/directory")
+    logger.info("  python3 main.py /path/to/directory -mp3")
+
+
 def build_batch_progress_renderable(total_files, output_path, current_file, progress):
     return Group(
         f"当前任务总数：{total_files}",
@@ -318,114 +353,91 @@ def decrypt_xm_file_worker(file_path, input_path, output_path, force_mp3):
     try:
         # Worker logs are suppressed; parent process prints ordered progress.
         logger.setLevel(logging.ERROR)
-        relative_path = os.path.relpath(file_path, input_path)
-        target_file_without_ext = os.path.splitext(relative_path)[0]
-        target_file = os.path.join(output_path, f"{target_file_without_ext}.xm")
-        decrypt_xm_file(file_path, output_path, force_mp3, output_file=target_file, verbose=False)
+        target_output_dir = build_target_output_dir(file_path, input_path, output_path)
+        decrypt_xm_file(file_path, target_output_dir, force_mp3, verbose=False)
         return True, file_path, ""
     except Exception as e:
         return False, file_path, str(e)
 
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
+def parse_cli_args(args):
     force_mp3 = False
     if "-mp3" in args:
         force_mp3 = True
         args = [arg for arg in args if arg != "-mp3"]
 
-    if len(args) < 1:
-        logger.info("使用方法:")
-        logger.info("  解密单个文件: python3 main.py <xm_file_path> [output_path] [-mp3]")
-        logger.info("  批量解密文件: python3 main.py <directory_path> [output_path] [-mp3]")
-        logger.info("\n示例:")
-        logger.info("  python3 main.py /path/to/file.xm")
-        logger.info("  python3 main.py /path/to/file.xm ./output")
-        logger.info("  python3 main.py /path/to/file.xm ./output -mp3")
-        logger.info("  python3 main.py /path/to/directory")
-        logger.info("  python3 main.py /path/to/directory ./output")
-        logger.info("  python3 main.py /path/to/directory ./output -mp3")
+    if len(args) != 1:
+        if len(args) > 1:
+            logger.error("错误: 不再支持自定义输出目录，输出会自动写入输入目录同级的 *_unlock 目录")
+        print_usage()
         sys.exit(1)
 
-    input_path = args[0]
-    output_path = "./output"
-    
-    # 根据输入路径类型自动判断是否为批量模式
-    if os.path.isdir(input_path):
-        is_batch = True
-    else:
-        is_batch = False
-    
-    # 处理输出路径参数
-    if len(args) >= 2:
-        output_path = args[1]
-    
-    files_to_decrypt = []
-    
-    if is_batch:
-        files_to_decrypt = collect_xm_files(input_path)
-        if not files_to_decrypt:
-            logger.error(f"错误: 在 {input_path} 及其子目录中找不到 .xm 文件")
-            sys.exit(1)
-    else:
-        if not os.path.isfile(input_path):
-            logger.error(f"错误: {input_path} 不是有效的文件")
-            sys.exit(1)
-        if not input_path.lower().endswith('.xm'):
-            logger.warning(f"警告: {input_path} 可能不是 .xm 文件")
-        files_to_decrypt = [input_path]
-    
+    return args[0], force_mp3
+
+
+def run_batch_decrypt(input_root_dir, files_to_decrypt, output_path, force_mp3):
     total_files = len(files_to_decrypt)
     successful = 0
     failed = 0
-    
-    if is_batch and total_files > 1:
-        worker_count = min(total_files, os.cpu_count() or 1)
-        progress = Progress(
-            TextColumn("当前任务进度："),
-            BarColumn(bar_width=30),
-            TextColumn("{task.completed}/{task.total} ({task.percentage:>3.0f}%)"),
-            console=console,
-            expand=False,
-        )
-        task_id = progress.add_task("decrypt", total=total_files)
-        completed_count = 0
-        current_file = "等待中"
+    failed_files = []
 
-        with Live(
-            build_batch_progress_renderable(total_files, output_path, current_file, progress),
-            console=console,
-            refresh_per_second=10,
-            transient=False,
-        ) as live:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                futures = [
-                    executor.submit(decrypt_xm_file_worker, file, input_path, output_path, force_mp3)
-                    for file in files_to_decrypt
-                ]
+    worker_count = min(total_files, os.cpu_count() or 1)
+    progress = Progress(
+        TextColumn("当前任务进度："),
+        BarColumn(bar_width=30),
+        TextColumn("{task.completed}/{task.total} ({task.percentage:>3.0f}%)"),
+        console=console,
+        expand=False,
+    )
+    task_id = progress.add_task("decrypt", total=total_files)
+    completed_count = 0
+    current_file = "等待中"
 
-                for future in as_completed(futures):
-                    current_ok, current_file_path, current_err = future.result()
-                    completed_count += 1
-                    if current_ok:
-                        successful += 1
-                    else:
-                        failed += 1
-                        logger.error(f"批量解密失败: {current_file_path}: {current_err}")
+    with Live(
+        build_batch_progress_renderable(total_files, output_path, current_file, progress),
+        console=console,
+        refresh_per_second=10,
+        transient=False,
+    ) as live:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(decrypt_xm_file_worker, file, input_root_dir, output_path, force_mp3)
+                for file in files_to_decrypt
+            ]
 
-                    current_file = os.path.basename(current_file_path)
-                    progress.update(task_id, completed=completed_count)
-                    live.update(
-                        build_batch_progress_renderable(total_files, output_path, current_file, progress)
-                    )
-    else:
-        for idx, file in enumerate(files_to_decrypt, 1):
-            try:
-                logger.info(f"[{idx}/{total_files}] 处理文件: {os.path.basename(file)}")
-                decrypt_xm_file(file, output_path, force_mp3)
-                successful += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"[{idx}/{total_files}] 解密 {file} 失败: {e}")
-    
+            for future in as_completed(futures):
+                current_ok, current_file_path, current_err = future.result()
+                completed_count += 1
+                if current_ok:
+                    successful += 1
+                else:
+                    failed += 1
+                    failed_files.append((current_file_path, current_err))
+
+                current_file = os.path.basename(current_file_path)
+                progress.update(task_id, completed=completed_count)
+                live.update(
+                    build_batch_progress_renderable(total_files, output_path, current_file, progress)
+                )
+
     logger.info(f"=====>> 解密完成！成功: {successful}/{total_files}, 失败: {failed}/{total_files}")
+    if failed_files:
+        logger.error("以下文件解密失败:")
+        for failed_file, error_message in failed_files:
+            logger.error(f"- {failed_file}: {error_message}")
+
+
+def main():
+    input_path, force_mp3 = parse_cli_args(sys.argv[1:])
+    try:
+        input_root_dir, files_to_decrypt = resolve_input_files(input_path)
+        output_path = build_unlock_output_path(input_root_dir)
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(f"错误: {e}")
+        sys.exit(1)
+
+    run_batch_decrypt(input_root_dir, files_to_decrypt, output_path, force_mp3)
+
+
+if __name__ == "__main__":
+    main()
