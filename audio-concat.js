@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { parseArgs } from 'util';
 
 const SUPPORTED_AUDIO_EXTENSIONS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus']);
 
@@ -19,19 +20,17 @@ function logError(message) {
     console.error(message);
 }
 
-// 递归扫描目录，只收集当前脚本支持合并的音频扩展名。
+// 使用新版 recursive readdir 扫描目录，只收集当前脚本支持合并的音频扩展名。
 function collectAudioFiles(rootDir) {
-    const files = [];
-    const entries = fs.readdirSync(rootDir, { withFileTypes: true });
-    for (const entry of entries) {
-        const fullPath = path.join(rootDir, entry.name);
-        if (entry.isDirectory()) {
-            files.push(...collectAudioFiles(fullPath));
-        } else if (entry.isFile() && SUPPORTED_AUDIO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
-            files.push(fullPath);
-        }
-    }
-    return files.sort();
+    const entries = fs.readdirSync(rootDir, {
+        recursive: true,
+        withFileTypes: true,
+    });
+
+    return entries
+        .filter((entry) => entry.isFile() && SUPPORTED_AUDIO_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))
+        .map((entry) => path.join(entry.parentPath, entry.name))
+        .sort();
 }
 
 function replaceInvalidChars(name) {
@@ -85,29 +84,31 @@ function printUsage() {
 }
 
 function parseCliArgs(args) {
-    let preview = false;
-    let filteredArgs = [...args];
+    const { values, positionals } = parseArgs({
+        args,
+        allowPositionals: true,
+        options: {
+            preview: {
+                type: 'boolean',
+                default: false,
+            },
+        },
+    });
 
-    if (filteredArgs.includes('--preview')) {
-        preview = true;
-        filteredArgs = filteredArgs.filter((arg) => arg !== '--preview');
-    }
-
-    if (filteredArgs.length !== 1) {
+    if (positionals.length !== 1) {
         printUsage();
         process.exit(1);
     }
 
-    return { inputPath: filteredArgs[0], preview };
+    return { inputPath: positionals[0], preview: values.preview };
 }
 
 function findExecutable(binaryName) {
-    const result = spawnSync('which', [binaryName], { encoding: 'utf8' });
-    if (result.status !== 0) {
+    const result = spawnSync(binaryName, ['-version'], { encoding: 'utf8' });
+    if (result.error || result.status !== 0) {
         return null;
     }
-    const executable = (result.stdout || '').trim();
-    return executable || null;
+    return binaryName;
 }
 
 // 从文件名尾部解析分段信息，支持裸数字、括号数字以及 上/中/下 三种风格。
