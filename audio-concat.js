@@ -6,19 +6,10 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 import { parseArgs } from 'util';
 
+import { logInfo, logWarn, logError } from './src/logger.js';
+import { replaceInvalidChars, buildTargetOutputDir } from './src/utils.js';
+
 const SUPPORTED_AUDIO_EXTENSIONS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus']);
-
-function logInfo(message) {
-    console.log(message);
-}
-
-function logWarn(message) {
-    console.warn(message);
-}
-
-function logError(message) {
-    console.error(message);
-}
 
 // 使用新版 recursive readdir 扫描目录，只收集当前脚本支持合并的音频扩展名。
 function collectAudioFiles(rootDir) {
@@ -33,10 +24,6 @@ function collectAudioFiles(rootDir) {
         .sort();
 }
 
-function replaceInvalidChars(name) {
-    return String(name).replace(/[\\/:*?"<>|]/g, ' ');
-}
-
 function buildConcatOutputPath(inputDir) {
     const normalizedInputDir = path.resolve(inputDir);
     const inputDirName = path.basename(normalizedInputDir);
@@ -44,11 +31,6 @@ function buildConcatOutputPath(inputDir) {
         throw new Error('不支持直接使用根目录作为输入目录');
     }
     return path.join(path.dirname(normalizedInputDir), `${inputDirName}_concat`);
-}
-
-function buildTargetOutputDir(filePath, inputRootDir, outputRootDir) {
-    const relativeDir = path.dirname(path.relative(inputRootDir, filePath));
-    return relativeDir === '.' ? outputRootDir : path.join(outputRootDir, relativeDir);
 }
 
 // 统一校验输入路径，并返回后续分组所需的根目录和候选音频文件列表。

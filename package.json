@@ -4,6 +4,9 @@
     "private": true,
     "type": "module",
     "main": "./main.js",
+    "scripts": {
+        "test": "node --test"
+    },
     "engines": {
         "node": ">=22"
     },

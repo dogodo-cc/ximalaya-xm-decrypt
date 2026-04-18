@@ -10,10 +10,7 @@ import pLimit from 'p-limit';
 import { colorize, formatPath, logInfo, logWarn, logError } from './src/logger.js';
 import { xmDecrypt } from './src/decrypt.js';
 import { findExt, convertToMp3, writeAudioTags } from './src/audio.js';
-
-function replaceInvalidChars(name) {
-    return String(name).replace(/[\\/:*?"<>|]/g, ' ');
-}
+import { replaceInvalidChars, buildTargetOutputDir } from './src/utils.js';
 
 function collectXmFiles(rootDir) {
     return fs.readdirSync(rootDir, { withFileTypes: true, recursive: true })
@@ -29,11 +26,6 @@ function buildUnlockOutputPath(inputDir) {
         throw new Error('不支持直接使用根目录作为输入目录');
     }
     return path.join(path.dirname(normalizedInputDir), `${inputDirName}_unlock`);
-}
-
-function buildTargetOutputDir(filePath, inputRootDir, outputRootDir) {
-    const relativeDir = path.dirname(path.relative(inputRootDir, filePath));
-    return relativeDir === '.' ? outputRootDir : path.join(outputRootDir, relativeDir);
 }
 
 function resolveInputFiles(inputPath) {
@@ -63,8 +55,7 @@ function resolveInputFiles(inputPath) {
 
 function printUsage() {
     logInfo('使用方法:');
-    logInfo('  npm run decrypt -- <xm_file_path_or_directory> [-mp3]');
-    logInfo('  node xm_decrypt.js <xm_file_path_or_directory> [-mp3]');
+    logInfo('  node main.js <xm_file_path_or_directory> [-mp3]');
     logInfo('');
     logInfo('说明:');
     logInfo('  传入文件时，只处理该文件，并以其父目录作为输入目录');
